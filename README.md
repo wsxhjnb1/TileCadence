@@ -29,7 +29,7 @@ All 90 fixed-history next-token choices matched. Eight full attention O/LSE comp
 
 ## Generate schedules on a CPU
 
-Use Python 3.11 or 3.12. All commands run from the repository root.
+Use Python 3.11 or 3.12. All commands run from the repository root. On Windows, clone into a short directory path to accommodate the vendored CUTLASS headers.
 
 ```bash
 python -m pip install -r requirements.txt
