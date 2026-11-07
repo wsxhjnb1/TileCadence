@@ -1,4 +1,4 @@
-# FA2 Residency Scheduler
+# TileCadence
 
 Constraint-guided CUDA/CuTe scheduling for FlashAttention-2. The solver explores where to keep Q, when shared K storage can be reused, how to overlap the next K load with work on the current tile, and how to split KV work during decode. Measured device time and compiler resource usage guide the next search round.
 
