@@ -1,0 +1,2 @@
+# Keep exact source bytes for the vendor manifest and solver receipts.
+* -text
