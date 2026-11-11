@@ -1,59 +1,77 @@
 # TileCadence
 
-Constraint-guided CUDA/CuTe scheduling for FlashAttention-2. The solver explores where to keep Q, when shared K storage can be reused, how to overlap the next K load with work on the current tile, and how to split KV work during decode. Measured device time and compiler resource usage guide the next search round.
+TileCadence generates FlashAttention-2 CUDA schedules that free shared-memory
+regions for other intermediate values. A released region can hold a larger
+tile or several smaller values that need to stay live at the same time.
+The planner models byte ranges, alignment, consumers, and barriers before
+the CUDA/CuTe templates receive the resulting offsets.
 
-```text
-B · solve legal tile, lifetime, and copy/wait schedules
-       ↓ emit CUDA/CuTe and compile
-A · fit candidate cost from latency, registers, shared memory, and occupancy
-       ↓ propose unseen schedules for B to solve
-     lock a per-shape policy and validate inside Qwen3
-```
+| Schedule | Shared-memory reuse |
+|---|---|
+| Two-tile attention | Release a 16 KiB Q tile, reload Q elsewhere for the next QK, and keep two 4 KiB probability checkpoints in the released range until their PV consumers. An alternative places one probability checkpoint alongside a V stripe. |
+| Causal prefill | Use the terminal K region for two head-local LSE arrays and publish them at the existing O writeback barrier. |
+| Fused decode | Use the terminal V region for the output rows and LSE simultaneously, then export them for the existing split reduction. |
 
-## DGX Spark results
+The timing experiments price the whole schedule. A saved live range can cost
+extra loads, synchronization, or registers. On DGX Spark, long-prefill
+candidates reached **1.11–1.13×** against default FA2 over 13 shapes at
+8K–32K. The same-template comparison shows a much smaller contribution from
+the shared-memory handoff itself. The full results include short-shape and
+long-decode regressions. [Measurements](docs/measurements.md)
 
-Qwen3-4B, all 36 layers, BF16, GB10 (SM121). Baseline is the **native default** path from pinned upstream FlashAttention-2. Speedup is native time divided by scheduled time.
+## Install and solve on CPU
 
-| Batch | Prompt | Prefill attention | Prefill forward | Decode attention | Decode forward |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 8,192 | 1.0313× | 1.0032× | 1.0408× | 0.9990× |
-| 1 | 32,768 | 1.0498× | 1.0139× | 1.0040× | 1.0053× |
-| 4 | 8,192 | 1.0587× | 1.0074× | 1.0160× | 1.0060× |
-| 4 | 32,768 | **1.0397×** | **1.0161×** | 1.0022× | 1.0000× |
-
-At batch 4 and 32K, full prefill went from **36,630.5 to 36,050.4 ms** (95% process-cluster bootstrap interval for speedup 1.0152×–1.0170×). Attention is attributed to the main and required combine kernels in separate CUPTI traces. Full forward uses unprofiled CUDA-event intervals. Candidates were selected on development inputs before model confirmation.
-
-All 90 fixed-history next-token choices matched. Eight full attention O/LSE comparisons passed, with maximum absolute differences of 0.001953125 (O) and 1.04904e-5 (LSE). The separate later batch-4/32K **fused KV append** decode study found essentially flat attention (79.743 → 79.700 ms) and forward latency (122.872 → 123.085 ms), so it provides no stable decode speedup. The table uses the original growing DynamicCache path.
-
-[Timing data](evidence/model_timing.json) · [Numerical checks](evidence/numerical_proof.json) · [Measurement notes](evidence/README.md)
-
-## Generate schedules on a CPU
-
-Use Python 3.11 or 3.12. All commands run from the repository root. On Windows, clone into a short directory path to accommodate the vendored CUTLASS headers.
+Use Python 3.10 or newer. GPU execution uses CUDA-enabled PyTorch, a compatible
+CUDA Toolkit with `nvcc`, a C++20 compiler, and Ninja on PATH.
 
 ```bash
-python -m pip install -r requirements.txt
-mkdir -p work
-python solver_attention/spark/qwen3_long_ab_b_stage_v14.py catalog --out work/catalog.json
-python solver_attention/spark/qwen3_long_ab_controller_v14.py plan \
-  --catalog work/catalog.json --out work/round0.json
-python solver_attention/spark/qwen3_long_ab_b_stage_v14.py emit \
-  --catalog work/catalog.json --plan work/round0.json --out work/emitted
+python -m pip install -e ".[test]"
+python -m pytest
+python -m tilecadence.exchange --out runs/exchange
+python -m tilecadence.operator --phase prefill --out runs/prefill
+python -m tilecadence.operator --phase decode --out runs/decode
 ```
 
-The generated source directories include their solved schedules and file hashes. The retained first-round measurements can drive the A feedback step on a CPU. See [feedback replay](evidence/README.md#replay-hardware-feedback-on-a-cpu).
+`exchange` emits the ordered operations, placements, dependency replay, and
+CUDA source for each arm. `operator` emits the long-operator template with
+the offsets from the placement solver.
 
-## Compare the prefill operator on a GPU
+## Build and measure on a CUDA GPU
 
-Use Linux, a CUDA 13.0 PyTorch environment, a CUDA 13.0 toolkit, a C++20 host compiler, Ninja, and an SM121 GPU. The adapter builds the selected candidate and the upstream default path, checks complete O and LSE, and alternates role order for paired timings. This smoke benchmark uses synthetic strided Q/K/V at the Qwen3 shape, so it measures a single attention operator. The model table above comes from the retained pretrained-model study.
+Builds target the selected NVIDIA device at runtime, starting at compute
+capability 8.0. The installed toolkit must support the selected target.
+The two-tile and fused decode schedules use 32 KiB of shared memory per
+CTA. The grouped prefill schedule requires 96 KiB of opt-in shared memory.
+The two-tile demo is FP16/BF16 MHA with sequence length 64 and head dimension
+128. The long operators are BF16 Qwen-style GQA with 32 query heads, 8 KV
+heads, head dimension 128, batch 1 or 4, and 128–32768 tokens. The prefill
+baseline requires the upstream heuristic to use one split for the
+chosen device and shape.
 
 ```bash
-python -m pip install -r requirements.txt ninja
-CUDA_HOME=/usr/local/cuda-13.0 python bench_prefill.py --batch 4 --length 32768 --work work/prefill
+git clone https://github.com/Dao-AILab/flash-attention.git ../flash-attention
+git -C ../flash-attention checkout 49774b31c8d1172a5b28f72e9aed0f322bf4ccba
+git -C ../flash-attention submodule update --init csrc/cutlass
+python -m pip install ninja
+
+python -m tilecadence.bench_exchange --flash-attention-root ../flash-attention \
+  --plans runs/exchange --work runs/exchange-check --verify-only
+python -m tilecadence.bench_operator --flash-attention-root ../flash-attention \
+  --phase prefill --source runs/prefill --batches 1 --lengths 128 2048 8192 \
+  --work runs/prefill-bench
+python -m tilecadence.bench_operator --flash-attention-root ../flash-attention \
+  --phase decode --source runs/decode --batches 1 --lengths 128 2048 8192 \
+  --work runs/decode-bench
 ```
 
-Scope is dense causal prefill and single-query decode with Qwen3-4B head geometry (32 query heads, 8 KV heads, head dimension 128). The public build entry point covers prefill. The solver also emits split-KV decode source. The original model checkpoint, captured tensors, and compiled binaries are kept out of the source distribution.
+Pass `--device cuda:N` to select a visible device. The operator benchmark
+uses seeded synthetic inputs, checks O and LSE against the pinned original
+FA2 CUDA dispatch, and times preallocated calls with alternating GPU event
+pairs. Decode checks the previous/current results and both cache appends.
+Use `--verify-only` for a correctness smoke test. Each run writes its build
+identity, measured pairs, and compiled resources to a fresh directory.
+The two-tile benchmark also supports timed comparisons against an installed
+CUDA FA2 package and records that package's identity separately.
 
-## License
-
-Project code is MIT. Vendored FlashAttention and CUTLASS/CuTe code, and generated kernels derived from them, retain their upstream notices. See [third-party notices](THIRD_PARTY_NOTICES.md).
+See [third-party notices](THIRD_PARTY_NOTICES.md) for the FA2 and CUTLASS
+revisions and license terms.
